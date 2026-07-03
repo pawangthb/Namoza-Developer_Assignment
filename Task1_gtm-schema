@@ -1,0 +1,98 @@
+# Task 01 — GTM Event Schema (OrthoNow)
+
+## 1. Event Schema
+
+| Event Name | Trigger Type | Key Parameters | Feeds Into (GA4) |
+|---|---|---|---|
+| `call_now_click` | Click trigger, Just Links, click ID/class contains `call-now-btn` | `page_location`, `click_text` (the phone number), `page_type` (homepage/clinic/landing) | Engagement report, "High-Intent Contact" audience |
+| `whatsapp_click` | Click trigger, Click URL contains `wa.me` | `page_location`, `widget_position`, `page_type` | Engagement report, secondary Ads conversion |
+| `clinic_page_view` | GA4 Event tag on Page View, deduped against base `page_view` | `clinic_name`, `clinic_id`, `page_location` | Pages & Screens, filtered by clinic |
+| `guide_form_submit` | Form Submission trigger if it's a plain POST — more likely a Custom Event trigger since this is a 5-year-old WP build and the form's probably AJAX | `form_name` = patient_guide, `lead_source_page`, `phone_provided` (bool) | Lead gen funnel, "PDF Leads" audience |
+| `guide_download` | Custom Event, pushed only after the form succeeds and PDF actually unlocks | `file_name`, `form_name`, `lead_source_page` | Content engagement, download completion vs submits |
+| `blog_scroll_depth` | Scroll Depth trigger, 25/50/75/90% | `percent_scrolled`, `article_title`, `article_category` | Engagement, content ROI signal |
+| `booking_step_start` | Custom Event, pushed when a step renders | `step_number`, `step_name`, `clinic_location` (if selected already) | Funnel Exploration, entry per step |
+| `booking_step_complete` | Custom Event, pushed on validated "Next" click | `step_number`, `step_name`, `clinic_location`, `specialty` | Funnel Exploration, step completion |
+| `booking_confirmed` | Custom Event, pushed only after backend confirms — not on the client "Confirm" click | `booking_id`, `clinic_location`, `specialty`, `appointment_date` | Primary conversion, imported to Google Ads |
+| `booking_abandoned` (extra, worth adding) | Custom Event via `beforeunload` if user is past step 1 with no completion | `last_step_reached`, `clinic_location`, `time_on_form` | Drop-off diagnostics, remarketing audience |
+
+Naming's snake_case, verb at the end (`_click`, `_submit`, `_complete`) so they sort together in the GA4 events list once there are 15+ of these in the account.
+
+---
+
+## 2. Booking Funnel — Step Drop-off
+
+GTM can't see into a JS-rendered multi-step form on its own. It only reacts to things happening in the DOM/browser — clicks, loads, scroll, history changes. Moving from step 1 to step 2 inside a React/Vue form (or even a plain show/hide div setup) doesn't trigger any of that. GTM has zero idea a "step 2" exists unless the front end tells it, via `dataLayer.push()`.
+
+So this part isn't really a GTM config task — it's a front-end instrumentation task. GTM just listens for the custom events once they exist.
+
+**Step view** — front end fires this the moment a step renders. Trigger: Custom Event, name `booking_step_start`.
+
+**Step complete** — fired on the Next/Confirm click handler, but only after validation passes. Trigger: Custom Event, name `booking_step_complete`. If this fires on the raw click instead, you're counting failed attempts as completions and the funnel numbers lie to you.
+
+Both feed a GA4 Event tag that pulls the pushed variables via Data Layer Variables.
+
+### The dataLayer pushes
+
+Step 1 — location + specialty:
+```json
+{
+  "event": "booking_step_complete",
+  "step_number": 1,
+  "step_name": "location_specialty_selected",
+  "clinic_location": "Downtown Clinic",
+  "specialty": "Sports Medicine"
+}
+```
+
+Step 2 — contact details:
+```json
+{
+  "event": "booking_step_complete",
+  "step_number": 2,
+  "step_name": "contact_details_entered",
+  "clinic_location": "Downtown Clinic",
+  "specialty": "Sports Medicine",
+  "preferred_date": "2026-07-15"
+}
+```
+No name/phone in here on purpose — that data can flow downstream to ad platforms or BigQuery, and PII shouldn't be riding in the dataLayer for that. This push just confirms the fields got filled.
+
+Step 3 — confirmed:
+```json
+{
+  "event": "booking_confirmed",
+  "step_number": 3,
+  "step_name": "booking_confirmed",
+  "clinic_location": "Downtown Clinic",
+  "specialty": "Sports Medicine",
+  "booking_id": "ORD-48213"
+}
+```
+`booking_id` has to come from the backend response, not be generated client-side — otherwise a booking that silently fails to save still counts as a conversion.
+
+### Funnel Exploration setup
+
+New Funnel Exploration, steps in order:
+1. `booking_step_start`, step_number = 1
+2. `booking_step_complete`, step_number = 1
+3. `booking_step_start`, step_number = 2
+4. `booking_step_complete`, step_number = 2
+5. `booking_confirmed`
+
+Run it open first (catches people entering mid-flow off a saved link or back button), then closed for a clean sequential rate. Turn on elapsed time between steps — a long gap between 1 and 2 usually means the date picker's broken, not that people got bored. Break it down by `clinic_location` too; wouldn't be surprised if one clinic's phone validation is rejecting a regional number format and tanking their step 2→3 rate specifically.
+
+### Who writes the push
+
+Front-end dev, not me, not GTM. GTM literally cannot detect a step change inside a form's internal state — there's nothing in the DOM to hook a trigger to unless someone adds it.
+
+What I'd hand the dev for step 2: the exact JSON above (copy-paste, not description), the exact moment to fire it (after validation passes, before the transition to step 3 — not on blur or keystroke or the raw click), a note that PII stays out of the payload, a reminder to debounce so double-clicking Next doesn't double-fire it, and then we test it together in GTM Preview + the dataLayer tab in DevTools before I wire up the trigger on my end.
+
+---
+
+## 3. Google Ads Import
+
+Going with `booking_confirmed`, not the higher-volume stuff like calls or WhatsApp clicks.
+
+Reason: Smart Bidding optimizes toward whatever you feed it. Feed it `call_now_click` and it starts chasing people who clicked a phone number — in healthcare that's a lot of tire-kickers and misdials, not real intent. `guide_form_submit` is even weaker, that's just someone curious about a PDF.
+
+`booking_confirmed` is the only event here that's backend-verified and actually tied to a real appointment on the books. That's what the bidding model should be learning from before spend scales up. Once volume's healthy (roughly 15-30/month is the usual Smart Bidding threshold), `guide_form_submit` can go in as a secondary, non-bidding conversion for visibility — but it shouldn't drive spend.
